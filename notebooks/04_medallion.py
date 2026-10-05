@@ -15,7 +15,9 @@
 
 # %%
 import _setup  # noqa: F401  -- adds scripts/ to sys.path
+from math import isclose
 from pathlib import Path
+from statistics import median, quantiles
 
 import polars as pl
 import duckdb
@@ -133,7 +135,8 @@ DeltaTable(GOLD).optimize.z_order(["model"])
 
 # %%
 gold_df = pl.from_arrow(DeltaTable(GOLD).to_pyarrow_table())
-print(gold_df)
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    print(gold_df.sort(["date", "model"]))
 
 # Slide-5 deliverable: "Gold p50/p95/cost qua ≥ 7 ngày". Make that explicit.
 n_dates = gold_df.select("date").n_unique()
@@ -150,8 +153,120 @@ assert n_dates >= 7, (
 )
 
 # %% [markdown]
+# ### Check every date/model pair and metric, not just distinct counts
+#
+# Expected keys come from Silver dates crossed with the three priced models.
+# Missing groups, duplicate keys and unpriced models must fail explicitly.
+# A zero error rate is valid; missing or out-of-range values are not.
+
+# %%
+con.register("gold", gold_df.to_arrow())
+n_silver_dates = con.sql("SELECT count(DISTINCT date) FROM silver").fetchone()[0]
+expected_gold_rows = n_silver_dates * 3
+missing_pairs = con.sql(f"""
+    WITH cost(model, c_in, c_out) AS ({COST_TABLE}),
+    expected AS (
+        SELECT DISTINCT s.date, c.model FROM silver s CROSS JOIN cost c
+    )
+    SELECT date, model FROM expected
+    EXCEPT SELECT date, model FROM gold
+    ORDER BY 1, 2
+""").fetchall()
+unpriced_rows = con.sql(f"""
+    WITH cost(model, c_in, c_out) AS ({COST_TABLE})
+    SELECT count(*) FROM silver s LEFT JOIN cost c USING (model)
+    WHERE c.model IS NULL
+""").fetchone()[0]
+duplicate_keys = con.sql("""
+    SELECT count(*) FROM (
+        SELECT date, model FROM gold GROUP BY 1, 2 HAVING count(*) > 1
+    )
+""").fetchone()[0]
+invalid_metrics = con.sql("""
+    SELECT count(*) FROM gold
+    WHERE date IS NULL OR model IS NULL
+       OR p50_latency_ms IS NULL OR p95_latency_ms IS NULL
+       OR NOT isfinite(p50_latency_ms) OR NOT isfinite(p95_latency_ms)
+       OR p50_latency_ms < 0 OR p50_latency_ms > p95_latency_ms
+       OR cost_usd IS NULL OR NOT isfinite(cost_usd) OR cost_usd <= 0
+       OR error_rate IS NULL OR NOT isfinite(error_rate)
+       OR error_rate NOT BETWEEN 0 AND 1
+       OR total_prompt_tokens IS NULL OR total_prompt_tokens < 0
+       OR total_completion_tokens IS NULL OR total_completion_tokens < 0
+""").fetchone()[0]
+print(f"Missing date/model pairs: {missing_pairs}")
+print(f"Expected/actual Gold rows: {expected_gold_rows} / {gold_df.height}")
+print(f"Silver rows without a cost model: {unpriced_rows}")
+print(f"Duplicate Gold keys: {duplicate_keys}")
+print(f"Gold rows with invalid metrics: {invalid_metrics}")
+
+# %% [markdown]
+# ### Independently recompute one group's metrics from Silver
+#
+# Python's inclusive quantiles match continuous percentile interpolation.
+# Token costs and error rate are recomputed from raw Silver rows, using the
+# lab's illustrative rates. This checks a real group, not production pricing.
+
+# %%
+assert gold_df.height > 0, "Gold is empty — no group can be verified"
+sample_date, sample_model = gold_df.sort(["date", "model"]).select("date", "model").row(0)
+sample_rows = con.execute("""
+    SELECT latency_ms, prompt_tokens, completion_tokens, status
+    FROM silver WHERE date = ? AND model = ?
+""", [sample_date, sample_model]).fetchall()
+assert len(sample_rows) >= 2, "The reference group needs at least two latency samples"
+c_in, c_out = con.execute(f"""
+    WITH cost(model, c_in, c_out) AS ({COST_TABLE})
+    SELECT c_in, c_out FROM cost WHERE model = ?
+""", [sample_model]).fetchone()
+# SQL VALUES can infer DECIMAL rates; normalize for Python arithmetic.
+c_in, c_out = float(c_in), float(c_out)
+latencies = [row[0] for row in sample_rows]
+expected_metrics = {
+    "p50_latency_ms": median(latencies),
+    "p95_latency_ms": quantiles(latencies, n=100, method="inclusive")[94],
+    "total_prompt_tokens": sum(row[1] for row in sample_rows),
+    "total_completion_tokens": sum(row[2] for row in sample_rows),
+    "error_rate": sum(row[3] is not None and row[3] != "ok" for row in sample_rows) / len(sample_rows),
+    "cost_usd": (sum(row[1] for row in sample_rows) * c_in
+                 + sum(row[2] for row in sample_rows) * c_out) / 1e6,
+}
+actual_metrics = con.execute("""
+    SELECT p50_latency_ms, p95_latency_ms, total_prompt_tokens,
+           total_completion_tokens, error_rate, cost_usd
+    FROM gold WHERE date = ? AND model = ?
+""", [sample_date, sample_model]).fetchone()
+reference_checks = {}
+print(f"Reference group: {sample_date} / {sample_model} ({len(sample_rows):,} Silver rows)")
+for (metric, expected), actual in zip(expected_metrics.items(), actual_metrics):
+    matches = actual is not None and isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-9)
+    reference_checks[metric] = matches
+    print(f"  [{'PASS' if matches else 'FAIL'}] {metric}: Gold={actual}, Python={expected}")
+
+# %% [markdown]
 # ## ✅ Deliverable check
 # - [ ] All three tables exist under `_lakehouse/{bronze,silver,gold}/`
 # - [ ] Silver has fewer rows than Bronze (dedup worked)
 # - [ ] Gold spans ≥ 7 dates × 3 models (slide §8 medallion contract)
-# - [ ] Cost & error_rate columns populated and non-zero
+# - [ ] Unique date/model keys; no missing groups or unpriced Silver models
+# - [ ] p50 ≤ p95; cost > 0; error_rate ∈ [0, 1]; metrics finite and non-null
+# - [ ] One group's metrics match an independent calculation from Silver
+
+# %%
+checks = {
+    "Bronze, Silver and Gold have Delta logs": all(
+        (Path(table_path) / "_delta_log").is_dir() for table_path in (BRONZE, SILVER, GOLD)
+    ),
+    "Silver has fewer rows than Bronze": silver_n < bronze_n,
+    "Gold spans at least 7 dates and exactly 3 models": n_dates >= 7 and n_models == 3,
+    "Gold covers every expected date/model pair": not missing_pairs,
+    "Gold has exactly the expected number of groups": gold_df.height == expected_gold_rows,
+    "every Silver model has a cost model": unpriced_rows == 0,
+    "Gold date/model keys are unique": duplicate_keys == 0,
+    "all Gold metrics are valid": invalid_metrics == 0,
+    "reference group matches Python calculation": all(reference_checks.values()),
+}
+for label, passed in checks.items():
+    print(f"  [{'PASS' if passed else 'FAIL'}] {label}")
+assert all(checks.values()), "NB4 incomplete — see FAIL rows above"
+print("\nNB4 complete.")
